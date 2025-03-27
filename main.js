@@ -3,7 +3,11 @@
 const utils = require('@iobroker/adapter-core');
 const os = require('node:os');
 
-const puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+
+// add the stealth plugin
+puppeteer.use(StealthPlugin());
 
 let watchdog = null;
 let browser = null;
@@ -18,9 +22,10 @@ class DropsWeather extends utils.Adapter {
             name: 'drops-weather',
         });
 
-        //this.baseUrl = 'https://www.meteox.com/en-gb/city/';
-        this.baseUrl = 'https://www.meteox.com/de-de/city/';
-
+        this.mainURLEN = 'https://www.meteox.com/';
+        this.mainURLDE = 'https://www.niederschlagsradar.de/';
+        this.pageTimeout = 60000;
+        
         this.on('ready', this.onReady.bind(this));
         this.on('unload', this.onUnload.bind(this));
     }
@@ -70,7 +75,7 @@ class DropsWeather extends utils.Adapter {
         }
 
         this.log.debug(`browserPath set to ${this.chromeExecutable ? this.chromeExecutable : 'puppeteer default'}`);
-        
+
         if (this.config.citycode === null || this.config.citycode === '') {
             this.log.error(`City code not set - please check instance configuration of ${this.namespace}`);
         } else {
@@ -78,10 +83,14 @@ class DropsWeather extends utils.Adapter {
         }
     }
 
-   
     //----------------------------------------------------------------------------------------------------
     async readDataFromServer() {
-        const url = this.baseUrl + this.config.citycode;
+        let mainURL = this.mainURLDE;
+
+        if (this.config.language == 'en') {
+            mainURL = this.mainURLEN;
+        }
+        const url = `${mainURL}${this.config.language}/city/${this.config.citycode}`;
 
         watchdog = this.setTimeout(() => {
             this.log.error('timeout connecting to brower ${this.chromeExecutable}');
@@ -93,6 +102,7 @@ class DropsWeather extends utils.Adapter {
             headless: true,
             defaultViewport: null,
             executablePath: this.chromeExecutable,
+            userDataDir: '/dev/null',
             args: [
                 '--periodic-task',
                 '--no-sandbox',
@@ -104,12 +114,29 @@ class DropsWeather extends utils.Adapter {
                 '--single-process',
                 '--disable-gpu',
                 '--ignore-certificate-errors',
+                '--disable-extensions',
+                '--disable-component-extensions-with-background-pages',
+                '--disable-default-apps',
+                '--mute-audio',
+                '--no-default-browser-check',
+                '--autoplay-policy=user-gesture-required',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-notifications',
+                '--disable-background-networking',
+                '--disable-breakpad',
+                '--disable-component-update',
+                '--disable-domain-reliability',
+                '--disable-sync',
             ],
         };
+        
         if (this.chromeExecutable) {
             puppeteerLaunchCfg[puppeteer.executablePath] = this.chromeExecutable;
         }
+        
         this.log.debug(`puppeteer.lauch invoked with ${JSON.stringify(puppeteerLaunchCfg)}`);
+        
         try {
             browser = await puppeteer.launch(puppeteerLaunchCfg);
 
@@ -135,7 +162,7 @@ class DropsWeather extends utils.Adapter {
             );
 
             await page.goto(url, {
-                waitUntil: 'networkidle2', // Warten, bis die Seite fertig geladen ist
+                waitUntil: 'networkidle0', // Warten, bis die Seite fertig geladen ist
             });
 
             await page.waitForFunction(
@@ -146,7 +173,7 @@ class DropsWeather extends utils.Adapter {
                         script.textContent.includes('RainGraph.create({'),
                     );
                 },
-                { timeout: 15000 },
+                { timeout: this.pageTimeout },
             );
 
             this.log.debug(`domcontent loaded, evaluate page`);
@@ -213,62 +240,59 @@ class DropsWeather extends utils.Adapter {
 
     //----------------------------------------------------------------------------------------------------
     async createStateData(data, channel) {
-      try {
-          let JSONdata_rain = [];
-          let JSONdata_echart = [];
-          let raindata = [];
-          let isRainingNow = data[0]?.precipitationrate > 0;
-          let rainStartsAt = '-1';
-          let rainStartAmount = 0;
-          let dateformat = 'HH:mm';
+        try {
+            let JSONdata_rain = [];
+            let JSONdata_echart = [];
+            let raindata = [];
+            let isRainingNow = data[0]?.precipitationrate > 0;
+            let rainStartsAt = '-1';
+            let rainStartAmount = 0;
 
-          if (channel === 'data_1h') {
-              dateformat = 'dd HH:mm';
-          }
+            this.setStateAsync(`${channel}.isRainingNow`, { val: isRainingNow, ack: true });
 
-          this.setStateAsync(`${channel}.isRainingNow`, { val: isRainingNow, ack: true });
+            await this.setStateAsync(`${channel}.timestamp`, { val: data[0]?.time || '', ack: true });
+            await this.setStateAsync(`${channel}.actualRain`, { val: data[0]?.precipitationrate || 0, ack: true });
 
-          await this.setStateAsync(`${channel}.timestamp`, { val: data[0]?.time || '', ack: true });
-          await this.setStateAsync(`${channel}.actualRain`, { val: data[0]?.precipitationrate || 0, ack: true });
+            for (const item of data) {
+                raindata.push(item.precipitationrate);
 
-          for (const item of data) {
-              raindata.push(item.precipitationrate);
+                const date = new Date(item.time);
+                const timestamp = date.getTime();
 
-              const date = new Date(item.time);
-              const timestamp = date.getTime(); 
+                if (rainStartsAt === '-1' && item.precipitationrate > 0) {
+                    rainStartsAt = date.toISOString();
+                    rainStartAmount = item.c ?? 0;
+                }
 
-              if (rainStartsAt === '-1' && item.precipitationrate > 0) {
-                  rainStartsAt = date.toISOString();
-                  rainStartAmount = item.c ?? 0;
-              }
+                JSONdata_rain.push({
+                    label: date.toLocaleTimeString('de-de', { hour: '2-digit', minute: '2-digit' }), // fromatiere ausgabe
+                    value: item.precipitationrate.toString(),
+                });
 
-              JSONdata_rain.push({
-                  label: date.toLocaleTimeString('de-de', { hour: '2-digit', minute: '2-digit' }), // fromatiere ausgabe
-                  value: item.precipitationrate.toString(),
-              });
+                JSONdata_echart.push({
+                    ts: timestamp,
+                    val: item.precipitationrate,
+                });
+            }
 
-              JSONdata_echart.push({
-                  ts: timestamp,
-                  val: item.precipitationrate,
-              });
-          }
+            this.log.debug(`Rain (${channel}): ${JSON.stringify(JSONdata_rain)}`);
 
-          this.log.debug(`Rain (${channel}): ${JSON.stringify(JSONdata_rain)}`);
-
-          await this.setStateAsync(`${channel}.chartRain`, { val: JSON.stringify(JSONdata_rain), ack: true });
-          await this.setStateAsync(`${channel}.echartRain`, { val: JSON.stringify(JSONdata_echart), ack: true });
-          await this.setStateAsync(`${channel}.raindata`, { val: JSON.stringify(raindata), ack: true });
-          await this.setStateAsync(`${channel}.rainStartsAt`, { val: rainStartsAt, ack: true });
-          await this.setStateAsync(`${channel}.startRain`, { val: rainStartAmount, ack: true });
-      } catch (error) {
-          this.log.error(error);
-      }
+            await this.setStateAsync(`${channel}.chartRain`, { val: JSON.stringify(JSONdata_rain), ack: true });
+            await this.setStateAsync(`${channel}.echartRain`, { val: JSON.stringify(JSONdata_echart), ack: true });
+            await this.setStateAsync(`${channel}.raindata`, { val: JSON.stringify(raindata), ack: true });
+            await this.setStateAsync(`${channel}.rainStartsAt`, { val: rainStartsAt, ack: true });
+            await this.setStateAsync(`${channel}.startRain`, { val: rainStartAmount, ack: true });
+        } catch (error) {
+            this.log.error(error);
+        }
     }
 
     async destroyBrowser() {
         this.log.debug('destroy browser');
         const pages = await browser.pages();
+        this.log.debug('pages ' + pages.length);
         for (let i = 0; i < pages.length; i++) {
+            await pages[i].deleteCookie();
             await pages[i].close();
         }
         await browser.close();
